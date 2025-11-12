@@ -1,0 +1,146 @@
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, trim, lower, year, to_date
+from pyspark.sql.types import IntegerType, FloatType
+
+# Initialize Glue & Spark Context
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+print("Starting Spotify ETL Job...")
+
+# STEP 1: READ RAW CSV FILES FROM S3
+
+artists_dyf = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={"paths": ["s3://spotify-raw-s/artists/artist.csv"]},
+    format="csv",
+    format_options={"withHeader": True}
+)
+
+albums_dyf = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={"paths": ["s3://spotify-raw-s/albums/albums.csv"]},
+    format="csv",
+    format_options={"withHeader": True}
+)
+
+tracks_dyf = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={"paths": ["s3://spotify-raw-s/tracks/tracks.csv"]},
+    format="csv",
+    format_options={"withHeader": True}
+)
+
+print("CSV files successfully read from S3 bucket")
+
+# STEP 2: CONVERT DYNAMICFRAMES TO DATAFRAMES
+
+artists_df = artists_dyf.toDF()
+albums_df = albums_dyf.toDF()
+tracks_df = tracks_dyf.toDF()
+
+
+# STEP 3: CLEAN AND STANDARDIZE COLUMN NAMES
+artists_df = artists_df.toDF(*[c.lower().strip() for c in artists_df.columns])
+albums_df = albums_df.toDF(*[c.lower().strip() for c in albums_df.columns])
+tracks_df = tracks_df.toDF(*[c.lower().strip() for c in tracks_df.columns])
+
+# Rename primary key columns for consistency
+artists_df = artists_df.withColumnRenamed("id", "artist_id")
+tracks_df = tracks_df.withColumnRenamed("id", "track_id")
+
+print(" Cleaned and standardized column names")
+
+
+# STEP 4: KEEP ONLY NECESSARY COLUMNS
+artists_df = artists_df.select(
+    col("artist_id"),
+    col("name").alias("artist_name")
+)
+
+# Drop redundant album columns (like extra artist_* fields)
+drop_album_cols = [c for c in albums_df.columns if c.startswith("artist_") and c != "artist_id"]
+if "duration_ms" in albums_df.columns:
+    drop_album_cols += ["duration_ms"]
+albums_df = albums_df.drop(*drop_album_cols)
+
+
+# STEP 5: HANDLE NULL VALUES
+albums_df = albums_df.fillna({
+    "album_popularity": 0,
+    "total_tracks": 0,
+    "release_date": "Unknown",
+    "label": "Unknown"
+})
+
+tracks_df = tracks_df.fillna({
+    "track_popularity": 0,
+    "explicit": "False"
+})
+
+print(" Null values handled")
+
+# STEP 6: TYPE CONVERSIONS AND FEATURE ENGINEERING
+# Cast numeric fields
+albums_df = albums_df.withColumn("album_popularity", col("album_popularity").cast(IntegerType()))
+albums_df = albums_df.withColumn("total_tracks", col("total_tracks").cast(IntegerType()))
+
+# Create duration in minutes if duration_sec exists
+if "duration_sec" in albums_df.columns:
+    albums_df = albums_df.withColumn("duration_sec", col("duration_sec").cast(FloatType()))
+    albums_df = albums_df.withColumn("duration_min", (col("duration_sec") / 60).cast(FloatType()))
+
+tracks_df = tracks_df.withColumn("track_popularity", col("track_popularity").cast(IntegerType()))
+
+# Extract release year if release_date is valid
+if "release_date" in albums_df.columns:
+    albums_df = albums_df.withColumn(
+        "release_year",
+        year(to_date(col("release_date"), "yyyy-MM-dd HH:mm:ss z"))
+    )
+
+print("⚙️ Type conversions and feature engineering complete")
+
+# STEP 7: STANDARDIZE TEXT COLUMNS
+text_columns_albums = ["album_name", "album_type", "label"]
+for colname in text_columns_albums:
+    if colname in albums_df.columns:
+        albums_df = albums_df.withColumn(colname, trim(lower(col(colname))))
+
+if "artist_name" in artists_df.columns:
+    artists_df = artists_df.withColumn("artist_name", trim(lower(col("artist_name"))))
+
+print(" Text fields standardized")
+
+# STEP 8: REMOVE DUPLICATES AND INVALID ROWS
+artists_df = artists_df.dropDuplicates(["artist_id"])
+albums_df = albums_df.dropDuplicates(["album_id"])
+tracks_df = tracks_df.dropDuplicates(["track_id"])
+
+# Filter out null IDs
+albums_df = albums_df.filter(col("artist_id").isNotNull())
+tracks_df = tracks_df.filter(col("track_id").isNotNull())
+
+print("Removed duplicates and invalid records")
+
+# STEP 9: JOIN DATASETS
+# Join albums with artists, then join tracks
+albums_artists_df = albums_df.join(artists_df, on="artist_id", how="inner")
+final_df = albums_artists_df.join(tracks_df, on="track_id", how="inner")
+
+print("Successfully joined datasets (artists + albums + tracks)")
+
+# STEP 10: WRITE PROCESSED DATA TO S3 AS PARQUET
+final_dyf = DynamicFrame.fromDF(final_df, glueContext, "final_dyf")
+
+glueContext.write_dynamic_frame.from_options(
+    frame=final_dyf,
+    connection_type="s3",
+    connection_options={"path": "s3://spotify-processed-s/"},
+    format="parquet"
+)
+
+print("Spotify ETL Job Completed Successfully!")
