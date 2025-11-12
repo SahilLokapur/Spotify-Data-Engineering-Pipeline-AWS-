@@ -4,6 +4,7 @@ Spotify Data Engineering Pipeline (AWS)
 This project outlines a scalable, serverless data engineering pipeline built entirely on Amazon Web Services (AWS) to process and analyze raw Spotify dataset files (artists, tracks, albums). The goal was to transform disparate CSV files into an optimized, easily queryable format for business intelligence and data visualization.
 
 Architecture and Technologies
+
 Data Ingestion & Storage (AWS S3): Raw data is manually uploaded as CSV files to a designated S3 bucket (Landing Zone), serving as the primary source of truth.
 
 ETL Processing (AWS Glue): An AWS Glue ETL job is configured to read the raw CSV data. The job performs essential data integration steps, including inner joining the artist, track, and album datasets to create a unified view.
